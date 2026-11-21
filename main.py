@@ -10,9 +10,13 @@ earners, so the model fits both counts on a log-time scale, divides the two
 extrapolations for a counts-based median, fits the logit's own trend as a
 second median, blends the two in logit space, shrinks each trophy's drift
 toward its tier's typical drift, tempers the median with a refresh-dilution
-prior (Exophase refreshes hours apart and each refresh dilutes rates), and
-spreads the five quantiles with a logit-normal band built from refresh, trend
-and fit-residual uncertainty, asymmetric near 0% and 100%.
+temper (each trophy's own measured logit fall at the history's refresh
+jumps, or a rate-shaped prior fall when the history shows no jump,
+weighted by how likely a refresh is inside the horizon), and spreads the
+five quantiles with a logit-normal band built from a refresh component
+measured from the history's own jump sizes (or a prior floor when it
+shows none), trend and fit-residual uncertainty, growing with the horizon
+and asymmetric near 0% and 100%.
 
 Reads every *.in in MAKEFUN_INPUT_DIR (else /input), writes one *.out per
 case to MAKEFUN_OUTPUT_DIR (else /output).  Fully deterministic: no random
@@ -35,13 +39,24 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 EPOCH = datetime(2026, 11, 19, tzinfo=timezone.utc)
 
 # Spread bounds, in logit units, and the random-walk trend scale.
-SIGMA_MIN = 0.6
-SIGMA_MAX = 2.0
+SIGMA_MIN = 0.8
+SIGMA_MAX = 2.8
 TREND_SIGMA = 0.45
-# Logit move a median may make from the last rate, and the refresh prior
-# used when the history shows no refresh jump at all.
+# Logit move a median may make from the last rate.
 MAX_LOGIT_MOVE = 3.0
-DEFAULT_REFRESH_FALL = 1.0
+# Refresh priors.  FALL_PRIOR is the logit fall one refresh inflicts on
+# the most susceptible trophy (a late, slow trophy whose earners barely
+# grow while tracked players jump); a trophy's own prior fall scales with
+# (1 - rate), so near-100% and early trophies are barely pulled down.
+# REFRESH_TAU is the timescale over which a refresh inside the horizon
+# goes from unlikely to near-certain at this stage of the launch.
+# PRIOR_REFRESH_SIG is the refresh component of the spread when the
+# history shows no jump at all: it must stay large, because a refresh is
+# likely inside any horizon of a few hours and the launch-night jump
+# shows how far rates can move at one.
+FALL_PRIOR = 1.3
+REFRESH_TAU = 2.5
+PRIOR_REFRESH_SIG = 1.5
 PLATINUM_CAP = 3.0
 
 
@@ -121,10 +136,35 @@ def last_known(rates, upto):
     return None
 
 
-def estimate_refresh_fall(reads, n_trophies):
-    """Typical logit fall of a rate when tracked players jump at a refresh.
-    Returns (fall, jumps_seen).  Falls back to the prior when no jump shows."""
-    falls = []
+def median_of(values):
+    s = sorted(values)
+    m = len(s)
+    return s[m // 2] if m % 2 else 0.5 * (s[m // 2 - 1] + s[m // 2])
+
+
+def percentile_of(sorted_values, q):
+    """Nearest-rank percentile of an already sorted list."""
+    if not sorted_values:
+        return 0.0
+    idx = min(len(sorted_values) - 1,
+              max(0, int(math.ceil(q * len(sorted_values))) - 1))
+    return sorted_values[idx]
+
+
+def refresh_stats(reads, n_trophies):
+    """What the case history's own refresh jumps say.
+
+    For each jump (a read where tracked players grow), record, per trophy,
+    the signed logit move of its rate (positive = the rate fell) and the
+    absolute moves overall.  Returns (per_trophy_fall, spread_base,
+    jumps_seen): per-trophy fall is the median signed fall at jumps,
+    floored at zero, or None where the trophy was never readable across a
+    jump; spread_base is a robust spread of the absolute moves -- the
+    median absolute move plus half the gap to the 90th percentile -- or
+    the prior floor when the history shows no jump at all.
+    """
+    per_trophy_moves = [[] for _ in range(n_trophies)]
+    abs_moves = []
     jumps = 0
     for prev, cur in zip(reads, reads[1:]):
         n0 = prev.get("players_tracked") or 0
@@ -137,13 +177,23 @@ def estimate_refresh_fall(reads, n_trophies):
         for i in range(min(n_trophies, len(r0), len(r1))):
             if r0[i] is None or r1[i] is None:
                 continue
-            drop = logit(r0[i]) - logit(r1[i])
-            if drop > 0.0:
-                falls.append(drop)
-    if falls:
-        falls.sort()
-        return falls[len(falls) // 2], jumps
-    return DEFAULT_REFRESH_FALL, 0
+            move = logit(r0[i]) - logit(r1[i])
+            per_trophy_moves[i].append(move)
+            abs_moves.append(abs(move))
+    falls = []
+    for moves in per_trophy_moves:
+        if moves:
+            falls.append(max(0.0, median_of(moves)))
+        else:
+            falls.append(None)
+    if abs_moves:
+        abs_moves.sort()
+        med = median_of(abs_moves)
+        spread = med + 0.5 * (percentile_of(abs_moves, 0.9) - med)
+        spread = max(0.7, spread)
+    else:
+        spread = PRIOR_REFRESH_SIG
+    return falls, spread, jumps
 
 
 def forecast_case(case):
@@ -174,9 +224,15 @@ def forecast_case(case):
     n_target = math.exp(my_n + slope_n * (target_x - mx_n))
     n_target = max(n_target, tracked[-1])
 
-    fall, _jumps = estimate_refresh_fall(history, n)
-    # Chance at least one refresh lands inside the horizon (mean gap ~8h).
-    p_refresh = 1.0 - math.exp(-horizon_hours / 8.0)
+    # Refresh evidence from the history itself: per-trophy falls at past
+    # jumps, and a robust spread of how far rates moved at them.
+    jump_falls, refresh_base, jumps_seen = refresh_stats(history, n)
+    # Weight of the dilution temper: the chance a refresh lands inside
+    # the horizon, rising from 0 toward 1 over a few hours at launch.
+    temper_w = 1.0 - math.exp(-horizon_hours / REFRESH_TAU)
+    # Expected refreshes in the horizon (mean gap ~8h) drive the spread:
+    # more refreshes fit into a longer horizon, so the band widens.
+    refresh_growth = math.sqrt(1.0 + min(horizon_hours / 8.0, 3.0))
 
     # Per-trophy fits, then tier-median drifts for shrinkage.
     per_trophy = []
@@ -226,17 +282,27 @@ def forecast_case(case):
             "last_earn": max(0.0, last / 100.0 * tracked[-1]),
             "b_e": b_e, "b_l": b_l, "fit_sig": fit_sig, "move": move,
             "n_pts": len(use_x), "x_last": use_x[-1] if use_x else xs[-1],
+            "fall": jump_falls[i],
         })
         tier_slopes_e.setdefault(trophy["tier"], []).append(b_e)
         tier_slopes_l.setdefault(trophy["tier"], []).append(b_l)
 
-    def median_of(values):
-        s = sorted(values)
-        m = len(s)
-        return s[m // 2] if m % 2 else 0.5 * (s[m // 2 - 1] + s[m // 2])
-
     tier_med_e = {t: median_of(v) for t, v in tier_slopes_e.items()}
     tier_med_l = {t: median_of(v) for t, v in tier_slopes_l.items()}
+
+    # A trophy never readable across a jump borrows its tier's typical
+    # measured fall, else the overall one; with no jumps at all every
+    # fall stays None and the prior below is used instead.
+    measured = [it["fall"] for it in per_trophy if it["fall"] is not None]
+    overall_fall = median_of(measured) if measured else 0.0
+    tier_fall = {}
+    for tier in tier_slopes_e:
+        vals = [it["fall"] for it in per_trophy
+                if it["trophy"]["tier"] == tier and it["fall"] is not None]
+        tier_fall[tier] = median_of(vals) if vals else overall_fall
+    for it in per_trophy:
+        if it["fall"] is None:
+            it["fall"] = tier_fall[it["trophy"]["tier"]]
 
     rows = []
     for item in per_trophy:
@@ -267,9 +333,26 @@ def forecast_case(case):
         rate_logit = inv_logit(base_logit + b_l * step)
         # Blend the two medians in logit space.
         med_logit = 0.5 * logit(rate_counts) + 0.5 * logit(rate_logit)
-        # Refresh dilution tempers the median: several refreshes dilute
-        # rates over a long horizon while progression pushes them up.
-        med_logit -= 0.3 * fall * p_refresh
+        # Refresh dilution tempers the median: across a refresh a trophy's
+        # earners grow only as fast as newly tracked players earn it, so
+        # a trophy whose earners lag the tracked base is pulled down by
+        # its own measured fall at past jumps -- or, where the history
+        # shows no jump, by a prior fall that is largest for low-rate,
+        # slow-earner trophies and near zero for the near-100% trophy
+        # and the earliest trophies -- weighted by how likely a refresh
+        # is inside the horizon.  Over a long horizon the fitted
+        # progression trend dominates and this is only a temper on it.
+        if jumps_seen:
+            # The fitted trend already embeds the dilution the history's
+            # own refreshes caused, so a measured fall tempers the median
+            # by only half; a flat history embeds no dilution at all, so
+            # the prior applies in full.
+            fall_i = item["fall"]
+            temper_factor = 0.5
+        else:
+            fall_i = FALL_PRIOR * (1.0 - last / 100.0)
+            temper_factor = 1.0
+        med_logit -= fall_i * temper_w * temper_factor
         # Guardrails: cap the total logit move, keep near-100% trophies high,
         # keep the platinum low in week one.
         med_logit = min(max(med_logit, base_logit - MAX_LOGIT_MOVE),
@@ -281,14 +364,19 @@ def forecast_case(case):
         median_rate = inv_logit(med_logit)
 
         # Spread: refresh + trend (grows with sqrt horizon) + fit residual.
+        # The refresh component is measured from the history's own jumps
+        # (or the prior floor when it shows none), and grows with the
+        # horizon because more refreshes fit into a longer one; it is the
+        # dominant term, so the band would have covered a launch-night
+        # sized refresh, not just the quiet hours.
+        refresh_sig = refresh_base * refresh_growth
+        trend_sig = TREND_SIGMA * math.sqrt(horizon_days)
         if item["n_pts"] < 3:
-            sigma = 1.2
+            fit_comp = 0.5
         else:
-            refresh_sig = 0.7 * fall * math.sqrt(p_refresh)
-            trend_sig = TREND_SIGMA * math.sqrt(horizon_days)
-            fit_sig = min(0.8, 1.5 * item["fit_sig"])
-            sigma = math.sqrt(refresh_sig ** 2 + trend_sig ** 2 + fit_sig ** 2)
-            sigma = min(SIGMA_MAX, max(SIGMA_MIN, sigma))
+            fit_comp = min(0.8, 1.5 * item["fit_sig"])
+        sigma = math.sqrt(refresh_sig ** 2 + trend_sig ** 2 + fit_comp ** 2)
+        sigma = min(SIGMA_MAX, max(SIGMA_MIN, sigma))
 
         # Asymmetric tails near the boundaries: the long tail reaches
         # further, the short tail less far, keeping the total width sane.

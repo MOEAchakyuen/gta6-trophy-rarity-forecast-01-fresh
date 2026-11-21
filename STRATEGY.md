@@ -47,14 +47,26 @@ few distinct reads inform it. A trophy nobody has reached yet has a flat
 past but a real future as players arrive, so low-rate trophies get a share
 of their tier's typical upward drift rather than a forced flat future.
 
-## Refresh / dilution prior
+## Refresh / dilution temper (v2)
 
 The history's refresh jumps show how much rates fall when tracked players
-jump. The typical logit fall at a refresh is estimated from the distinct
-reads (with a prior of about 1 logit unit when no jump shows), and it
-tempers the median — over a four-and-a-half-day horizon several refreshes
-will happen, each diluting rates somewhat, while progression pushes them up
-— and widens the spread.
+jump, per trophy: at each jump, a trophy's earners grow only as fast as
+newly tracked players earn it, so the trophies whose earners lag the
+tracked base fall furthest. Each trophy's median signed logit fall across
+the jumps it was readable at is its measured fall (a trophy never readable
+across a jump borrows its tier's median fall, else the overall one). Where
+the history shows no jump at all -- the practice's flat launch night --
+there is no measured fall, so a prior applies instead: 1.3 logit units for
+the most susceptible trophy, scaled by (1 - rate), so low-rate, slow-earner
+trophies are pulled down most and the near-100% trophy and the earliest
+trophies barely at all. The temper is the fall weighted by how likely a
+refresh is inside the horizon (rising from 0 toward 1 over about two and a
+half hours at this stage of the launch), so over a 90-minute horizon the
+median sits clearly below the last rate, while over four and a half days
+the fitted progression trend dominates and the temper is only a drag on
+it. A measured fall tempers by only half, because the fitted trend already
+embeds the dilution the history's own refreshes caused; a flat history
+embeds no dilution, so the prior applies in full.
 
 ## Guardrails
 
@@ -66,13 +78,21 @@ earners are growing fast in percentage terms. Early story trophies already
 at high rates stay high; mid-story trophies climb the most in absolute
 terms; late and hidden trophies climb from near zero but stay modest.
 
-## Spread
+## Spread (v2)
 
 The five quantiles come from a logit-normal spread around the median. The
-spread in logit units combines a refresh component (from the observed jump
-sizes), a trend component growing with the square root of the horizon in
-days, and a fit-uncertainty component from the residuals of the per-trophy
-fits, clamped between 0.6 and 2.0 logit units. The band is asymmetric near
+refresh component is measured from the history's own jumps: the median
+absolute logit move at jumps plus half the gap to the 90th percentile of
+those moves (floored at 0.7), so the band is sized by what refreshes
+actually did to rates. When the history shows no jump, the component does
+not fall to zero: a prior floor of 1.5 logit units applies, because a
+refresh is likely inside any horizon of a few hours at this stage of the
+launch and the launch-night jump shows how large one can be. The refresh
+component grows with the horizon (more refreshes fit into a longer one),
+and is combined in quadrature with a trend component growing with the
+square root of the horizon in days and a fit-uncertainty component from
+the residuals of the per-trophy fits (0.5 where too few reads inform a
+fit), clamped between 0.8 and 2.8 logit units. The band is asymmetric near
 the boundaries: for a median above 90 the lower tail reaches much further
 down than the upper tail reaches up, and for a median below about 1 the
 upper tail reaches much further up; the saturated 100% trophy gets a median
